@@ -9,6 +9,11 @@
 #   ORIG_DEB         original .deb to repackage (default: dpkg-repack the install)
 #   PKG              installed package name (default: positron)
 #   NODE_IMAGE       container image used when host node is missing/too old
+#
+# Usage: build-deb.sh            build build/<pkg>_<ver>+patched.<hash>_<arch>.deb
+#        build-deb.sh --overlay  instead copy the rebuilt bundles over the installed
+#                                Positron in place (any distro; uses sudo, keeps
+#                                *.orig backups). Re-run after each Positron upgrade.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
@@ -62,7 +67,10 @@ esbuild_ext() { (cd "$1" && rm -rf dist && node --experimental-strip-types --no-
 # Container entry point
 if [[ ${1:-} == --build-exts ]]; then shift; build_exts "$@"; exit; fi
 
-for t in git dpkg-deb; do command -v "$t" >/dev/null || die "missing $t"; done
+MODE=deb
+[[ ${1:-} == --overlay ]] && MODE=overlay
+tools=(git); [[ $MODE == deb ]] && tools+=(dpkg-deb)
+for t in "${tools[@]}"; do command -v "$t" >/dev/null || die "missing $t"; done
 
 shopt -s nullglob
 patches=("$PATCH_DIR"/*.patch)
@@ -119,6 +127,36 @@ else
 	"$engine" run --rm "${uargs[@]}" -v "$ROOT:$ROOT" -w "$ROOT" \
 		-e HOME=/tmp -e npm_config_cache="$BUILD/.npm-cache" \
 		"$NODE_IMAGE" bash "$ROOT/build-deb.sh" --build-exts "$SRC" "$BUILD/root-lock.json" "${exts[@]}"
+fi
+
+# --- Overlay onto the installed Positron --------------------------------------
+if [[ $MODE == overlay ]]; then
+	command -v positron >/dev/null || die "positron not on PATH"
+	app=$(dirname "$(readlink -f "$(command -v positron)")")
+	extroot=
+	for d in "$app/resources/app/extensions" "$app/../resources/app/extensions" \
+		"$app/../share/positron/resources/app/extensions" /usr/share/positron/resources/app/extensions \
+		/opt/positron/resources/app/extensions /opt/Positron/resources/app/extensions; do
+		[[ -d $d/${exts[0]} ]] && { extroot=$(readlink -f "$d"); break; }
+	done
+	[[ -n $extroot ]] || die "could not find Positron's extensions directory near $app"
+	SUDO=; [[ -w $extroot/${exts[0]}/dist ]] || SUDO=sudo
+	log "Installing into $extroot${SUDO:+ (sudo)}"
+	for e in "${exts[@]}"; do
+		dst=$extroot/$e/dist
+		[[ -d $dst ]] || die "$dst not found"
+		for f in "$SRC/extensions/$e/dist/"*; do
+			b=$dst/$(basename "$f")
+			[[ -e $b && ! -e $b.orig ]] && $SUDO cp -p "$b" "$b.orig"
+			$SUDO install -m 644 "$f" "$b"
+		done
+	done
+	log "Done. Fully quit and restart Positron."
+	echo "Revert with:"
+	for e in "${exts[@]}"; do
+		echo "  for f in $extroot/$e/dist/*.orig; do $SUDO mv \"\$f\" \"\${f%.orig}\"; done"
+	done
+	exit 0
 fi
 
 # --- Repackage ---------------------------------------------------------------

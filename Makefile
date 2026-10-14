@@ -1,4 +1,4 @@
-.PHONY: deb clean distclean
+.PHONY: deb overlay clean distclean
 
 deb:
 	./build-deb.sh
@@ -9,3 +9,7 @@ clean:
 
 distclean:
 	rm -rf build
+
+# Patch the installed Positron in place (e.g. Arch/AUR), no .deb
+overlay:
+	./build-deb.sh --overlay
