@@ -1,0 +1,59 @@
+From a0cf1a0abc61dd78ed0371653a33f3f0d2101c93 Mon Sep 17 00:00:00 2001
+From: Floyd Everest <me@floydeverest.com>
+Date: Tue, 13 Oct 2026 12:55:16 +1100
+Subject: [PATCH 4/4] dev-containers: fall back to 127.0.0.1 in the container
+ port relay
+
+The host->container relay always connected to ::1, on the assumption
+that positron-server listens there. The server binds to "localhost",
+which only resolves to ::1 if the container has IPv6 loopback. When
+IPv6 is disabled (e.g. a rootless Podman network with ipv6_enabled
+false) the server listens on 127.0.0.1 only, every relayed connection
+is refused, and the client fails with 'WebSocket close with status
+code 1006' even though the server is healthy.
+
+Try ::1 first and fall back to 127.0.0.1, for each of the bash, nc and
+socat relay variants.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FZKDAdw2eAGaetRMyaR7xv
+---
+ .../src/remote/portForwarding.ts               | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/extensions/positron-dev-containers/src/remote/portForwarding.ts b/extensions/positron-dev-containers/src/remote/portForwarding.ts
+index 4a0a7f07f..2181bf94a 100644
+--- a/extensions/positron-dev-containers/src/remote/portForwarding.ts
++++ b/extensions/positron-dev-containers/src/remote/portForwarding.ts
+@@ -84,14 +84,24 @@ export class PortForwardingManager {
+ 				// 1. Try bash with /dev/tcp (most efficient if bash is available)
+ 				// 2. Try netcat (nc) if bash is not available
+ 				// 3. Try socat as a last resort
+-				// Note: positron-server listens on ::1 (IPv6), so we use that instead of 127.0.0.1
++				// The server binds to "localhost", which resolves to ::1 when the
++				// container has IPv6 loopback but to 127.0.0.1 when it doesn't (e.g.
++				// IPv6 disabled on the container network). Try ::1, then 127.0.0.1.
+ 				const portForwardCommand = `
+ 					if command -v bash >/dev/null 2>&1; then
+-						exec bash -c 'exec 3<>/dev/tcp/::1/${remotePort}; cat <&3 & cat >&3; kill %1'
++						exec bash -c '{ exec 3<>/dev/tcp/::1/${remotePort}; } 2>/dev/null || exec 3<>/dev/tcp/127.0.0.1/${remotePort} || exit 1; cat <&3 & cat >&3; kill %1'
+ 					elif command -v nc >/dev/null 2>&1; then
+-						exec nc ::1 ${remotePort}
++						if nc -z ::1 ${remotePort} >/dev/null 2>&1; then
++							exec nc ::1 ${remotePort}
++						else
++							exec nc 127.0.0.1 ${remotePort}
++						fi
+ 					elif command -v socat >/dev/null 2>&1; then
+-						exec socat - TCP6:[::1]:${remotePort}
++						if socat -u /dev/null TCP6:[::1]:${remotePort} >/dev/null 2>&1; then
++							exec socat - TCP6:[::1]:${remotePort}
++						else
++							exec socat - TCP4:127.0.0.1:${remotePort}
++						fi
+ 					else
+ 						echo "ERROR: No suitable tool found for port forwarding (need bash, nc, or socat)" >&2
+ 						exit 1
+-- 
+2.43.0
+

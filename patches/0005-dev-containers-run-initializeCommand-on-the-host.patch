@@ -1,0 +1,265 @@
+From 1d240bf4f1fe314a6e4bfa4f4cca2a3403b6f1e4 Mon Sep 17 00:00:00 2001
+From: Floyd Everest <me@floydeverest.com>
+Date: Wed, 14 Oct 2026 12:09:17 +1100
+Subject: [PATCH] Dev Containers: run initializeCommand on the host
+
+initializeCommand was never run: the terminal build script omits it, and
+the vendored CLI code that handles it (runInitializeCommand via
+resolve/launch) is unreachable.
+
+Run it on the host in the workspace folder, as the spec requires, both
+when building (as the first step of the build script, before the image is
+built or the container created) and when reusing an existing container
+(spawned before the container is started, with output in the Dev
+Containers log). String commands go through sh -c / cmd /c, array
+commands run without a shell, and object commands run each entry in turn.
+A non-zero exit fails the build or aborts the reopen.
+
+The devcontainer.json lookup, parsing and variable substitution move out
+of buildAndCreate into loadDevContainerConfig() so both paths share them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FZKDAdw2eAGaetRMyaR7xv
+---
+ .../src/container/devContainerManager.ts      |   3 +
+ .../src/container/terminalBuilder.ts          | 175 ++++++++++++++----
+ 2 files changed, 146 insertions(+), 32 deletions(-)
+
+diff --git a/extensions/positron-dev-containers/src/container/devContainerManager.ts b/extensions/positron-dev-containers/src/container/devContainerManager.ts
+index 5a27e90b1..33c82e80d 100644
+--- a/extensions/positron-dev-containers/src/container/devContainerManager.ts
++++ b/extensions/positron-dev-containers/src/container/devContainerManager.ts
+@@ -167,6 +167,9 @@ export class DevContainerManager {
+ 			logger.info(`Removing existing container for rebuild: ${existingContainer.containerId}`);
+ 			await this.removeContainer(existingContainer.containerId);
+ 		} else if (existingContainer && !options.rebuild) {
++			// initializeCommand runs on every start, not just when building
++			await TerminalBuilder.runInitializeCommand(options.workspaceFolder);
++
+ 			// Start existing container if stopped
+ 			if (ContainerStateManager.isStopped(existingContainer)) {
+ 				logger.info(`Starting existing container: ${existingContainer.containerId}`);
+diff --git a/extensions/positron-dev-containers/src/container/terminalBuilder.ts b/extensions/positron-dev-containers/src/container/terminalBuilder.ts
+index 48872d872..772a37233 100644
+--- a/extensions/positron-dev-containers/src/container/terminalBuilder.ts
++++ b/extensions/positron-dev-containers/src/container/terminalBuilder.ts
+@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
+ import * as path from 'path';
+ import * as fs from 'fs';
+ import * as os from 'os';
++import * as cp from 'child_process';
+ import * as jsonc from 'jsonc-parser';
+ import { URI } from 'vscode-uri';
+ import { getLogger } from '../common/logger';
+@@ -40,6 +41,104 @@ function escapePowerShellArg(arg: string): string {
+ 	return arg;
+ }
+ 
++/**
++ * Finds, parses and variable-substitutes the workspace's devcontainer.json
++ */
++function loadDevContainerConfig(workspaceFolder: string) {
++	// Find the devcontainer.json file - check both standard locations
++	let devcontainerPath = path.join(workspaceFolder, '.devcontainer', 'devcontainer.json');
++	if (!fs.existsSync(devcontainerPath)) {
++		// Try .devcontainer.json in workspace root
++		devcontainerPath = path.join(workspaceFolder, '.devcontainer.json');
++		if (!fs.existsSync(devcontainerPath)) {
++			throw new Error(`Dev container configuration not found. Expected at ${path.join(workspaceFolder, '.devcontainer', 'devcontainer.json')} or ${path.join(workspaceFolder, '.devcontainer.json')}`);
++		}
++	}
++
++	// Setup folder paths
++	const folderName = path.basename(workspaceFolder);
++	const remoteWorkspaceFolder = `/workspaces/${folderName}`;
++
++	// Labels identifying this dev container; also the inputs to ${devcontainerId}
++	const idLabels = {
++		'devcontainer.local_folder': workspaceFolder,
++		'devcontainer.config_file': devcontainerPath,
++	};
++
++	// Read and parse the devcontainer.json (supports comments via JSONC), then
++	// expand ${localEnv:...}, ${localWorkspaceFolder}, ${containerWorkspaceFolder},
++	// ${devcontainerId} etc., as the dev container spec requires. ${containerEnv:...}
++	// is left for later, since it can only be resolved inside the running container.
++	const devContainerConfig = beforeContainerSubstitute(idLabels, substitute({
++		platform: process.platform,
++		configFile: URI.file(devcontainerPath),
++		localWorkspaceFolder: workspaceFolder,
++		containerWorkspaceFolder: remoteWorkspaceFolder,
++		env: process.env,
++	}, jsonc.parse(fs.readFileSync(devcontainerPath, 'utf8'))));
++
++	return { devcontainerPath, remoteWorkspaceFolder, idLabels, devContainerConfig };
++}
++
++/**
++ * Generates the script section that runs `initializeCommand` on the host, in
++ * the workspace folder, before the image is built. A failure aborts the build.
++ *
++ * String commands run through the platform shell (`sh -c` / `cmd /c`), array
++ * commands run without a shell, and object commands run each entry in turn.
++ */
++function generateInitializeCommandScript(
++	command: unknown,
++	workspaceFolder: string,
++	isWindows: boolean
++): string {
++	const commands: [string | undefined, string | string[]][] = [];
++	if (typeof command === 'string' || Array.isArray(command)) {
++		commands.push([undefined, command]);
++	} else if (command && typeof command === 'object') {
++		for (const [name, cmd] of Object.entries(command)) {
++			if (typeof cmd === 'string' || Array.isArray(cmd)) {
++				commands.push([name, cmd]);
++			}
++		}
++	}
++	if (commands.length === 0) {
++		return '';
++	}
++
++	let script = '';
++	if (isWindows) {
++		script += 'Write-Host "==> Running initializeCommand..."\n';
++		script += `Push-Location -LiteralPath ${escapePowerShellArg(workspaceFolder)}\n`;
++		script += 'try {\n';
++		for (const [name, cmd] of commands) {
++			if (name) {
++				script += `    Write-Host ${escapePowerShellArg(`Running ${name}...`)}\n`;
++			}
++			script += typeof cmd === 'string'
++				? `    & cmd.exe /c ${escapePowerShellArg(cmd)}\n`
++				: `    & ${cmd.map(escapePowerShellArg).join(' ')}\n`;
++			script += '    if ($LASTEXITCODE -ne 0) { throw "initializeCommand failed with exit code $LASTEXITCODE" }\n';
++		}
++		script += '} finally {\n';
++		script += '    Pop-Location\n';
++		script += '}\n\n';
++	} else {
++		script += 'echo "==> Running initializeCommand..."\n';
++		for (const [name, cmd] of commands) {
++			if (name) {
++				script += `echo ${escapeShellArg(`Running ${name}...`)}\n`;
++			}
++			const shellCmd = typeof cmd === 'string'
++				? `sh -c ${escapeShellArg(cmd)}`
++				: cmd.map(escapeShellArg).join(' ');
++			script += `(cd ${escapeShellArg(workspaceFolder)} && ${shellCmd})\n`;
++		}
++		script += '\n';
++	}
++	return script;
++}
++
+ /**
+  * Generates lifecycle hooks script to be included in the build script
+  */
+@@ -113,6 +212,45 @@ function generateLifecycleHooksScript(
+  * Builds and runs dev containers using actual docker commands in a terminal
+  */
+ export class TerminalBuilder {
++	/**
++	 * Run initializeCommand on the host without building, for when an existing
++	 * container is reused. Output goes to the Dev Containers log; a non-zero
++	 * exit rejects, so the container is not started.
++	 */
++	static async runInitializeCommand(workspaceFolder: string): Promise<void> {
++		const logger = getLogger();
++		const { devContainerConfig } = loadDevContainerConfig(workspaceFolder);
++		const isWindows = os.platform() === 'win32';
++		const script = generateInitializeCommandScript(devContainerConfig.initializeCommand, workspaceFolder, isWindows);
++		if (!script) {
++			return;
++		}
++
++		const [shell, args] = isWindows
++			? ['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$ErrorActionPreference = "Stop"\n${script}`]]
++			: ['/bin/sh', ['-c', `set -e\n${script}`]];
++
++		await new Promise<void>((resolve, reject) => {
++			const proc = cp.spawn(shell, args, { cwd: workspaceFolder });
++			let tail = '';
++			const onData = (data: Buffer) => {
++				const text = data.toString();
++				tail = (tail + text).slice(-2000);
++				for (const line of text.split(/\r?\n/)) {
++					if (line.trim()) {
++						logger.info(`[initializeCommand] ${line}`);
++					}
++				}
++			};
++			proc.stdout.on('data', onData);
++			proc.stderr.on('data', onData);
++			proc.on('error', reject);
++			proc.on('close', code => code === 0
++				? resolve()
++				: reject(new Error(`initializeCommand failed with exit code ${code}:\n${tail.trim()}`)));
++		});
++	}
++
+ 	/**
+ 	 * Build and create a dev container in a terminal
+ 	 */
+@@ -124,37 +262,7 @@ export class TerminalBuilder {
+ 		const logger = getLogger();
+ 		const config = Configuration.getInstance();
+ 
+-		// Find the devcontainer.json file - check both standard locations
+-		let devcontainerPath = path.join(workspaceFolder, '.devcontainer', 'devcontainer.json');
+-		if (!fs.existsSync(devcontainerPath)) {
+-			// Try .devcontainer.json in workspace root
+-			devcontainerPath = path.join(workspaceFolder, '.devcontainer.json');
+-			if (!fs.existsSync(devcontainerPath)) {
+-				throw new Error(`Dev container configuration not found. Expected at ${path.join(workspaceFolder, '.devcontainer', 'devcontainer.json')} or ${path.join(workspaceFolder, '.devcontainer.json')}`);
+-			}
+-		}
+-
+-		// Setup folder paths
+-		const folderName = path.basename(workspaceFolder);
+-		const remoteWorkspaceFolder = `/workspaces/${folderName}`;
+-
+-		// Labels identifying this dev container; also the inputs to ${devcontainerId}
+-		const idLabels = {
+-			'devcontainer.local_folder': workspaceFolder,
+-			'devcontainer.config_file': devcontainerPath,
+-		};
+-
+-		// Read and parse the devcontainer.json (supports comments via JSONC), then
+-		// expand ${localEnv:...}, ${localWorkspaceFolder}, ${containerWorkspaceFolder},
+-		// ${devcontainerId} etc., as the dev container spec requires. ${containerEnv:...}
+-		// is left for later, since it can only be resolved inside the running container.
+-		const devContainerConfig = beforeContainerSubstitute(idLabels, substitute({
+-			platform: process.platform,
+-			configFile: URI.file(devcontainerPath),
+-			localWorkspaceFolder: workspaceFolder,
+-			containerWorkspaceFolder: remoteWorkspaceFolder,
+-			env: process.env,
+-		}, jsonc.parse(fs.readFileSync(devcontainerPath, 'utf8'))));
++		const { devcontainerPath, remoteWorkspaceFolder, idLabels, devContainerConfig } = loadDevContainerConfig(workspaceFolder);
+ 
+ 		// Determine the Dockerfile or image
+ 		const devcontainerDir = path.dirname(devcontainerPath);
+@@ -178,7 +286,7 @@ export class TerminalBuilder {
+ 		// Build the image name
+ 		let builtImageName: string;
+ 		if (dockerfilePath) {
+-			builtImageName = `vsc-${folderName}-${Date.now()}`.toLowerCase();
++			builtImageName = `vsc-${path.basename(workspaceFolder)}-${Date.now()}`.toLowerCase();
+ 		} else if (imageName) {
+ 			builtImageName = imageName;
+ 		} else {
+@@ -252,6 +360,9 @@ export class TerminalBuilder {
+ 
+ 		let scriptContent = generateScriptContent();
+ 
++		// Run initializeCommand on the host before building or creating anything
++		scriptContent += generateInitializeCommandScript(devContainerConfig.initializeCommand, workspaceFolder, isWindows);
++
+ 		// Generate build command using spec-node if we have a Dockerfile
+ 		if (dockerfilePath) {
+ 			const buildContext = devContainerConfig.build?.context ? path.join(devcontainerDir, devContainerConfig.build.context) : devcontainerDir;
+-- 
+2.43.0
+

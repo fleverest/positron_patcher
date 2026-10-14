@@ -1,0 +1,94 @@
+From a765e6c5f885d65c68b6a9491be7e9b61a45a943 Mon Sep 17 00:00:00 2001
+From: Floyd Everest <me@floydeverest.com>
+Date: Tue, 13 Oct 2026 12:10:43 +1100
+Subject: [PATCH 1/3] dev-containers: expand variables in devcontainer.json
+ when building
+
+TerminalBuilder parsed devcontainer.json with jsonc and used the raw
+values, so ${localEnv:...}, ${localWorkspaceFolder},
+${containerWorkspaceFolder} and ${devcontainerId} reached docker
+literally (e.g. in mounts, containerEnv, runArgs, build.args). Run the
+spec's substitute()/beforeContainerSubstitute() over the parsed config,
+as the reference CLI does. ${containerEnv:...} is left untouched.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FZKDAdw2eAGaetRMyaR7xv
+---
+ .../src/container/terminalBuilder.ts          | 34 +++++++++++++------
+ 1 file changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/extensions/positron-dev-containers/src/container/terminalBuilder.ts b/extensions/positron-dev-containers/src/container/terminalBuilder.ts
+index 7d6010d22..f2ea76bd2 100644
+--- a/extensions/positron-dev-containers/src/container/terminalBuilder.ts
++++ b/extensions/positron-dev-containers/src/container/terminalBuilder.ts
+@@ -8,12 +8,14 @@ import * as path from 'path';
+ import * as fs from 'fs';
+ import * as os from 'os';
+ import * as jsonc from 'jsonc-parser';
++import { URI } from 'vscode-uri';
+ import { getLogger } from '../common/logger';
+ import { Configuration } from '../common/configuration';
+ import { generateDockerBuildCommand, generateDockerCreateCommand } from '../spec/spec-node/devContainersSpecCLI';
+ import { formatCommandWithEcho, formatCommandForShell, escapeShellArg } from '../spec/spec-node/commandGeneration';
+ import { prepareFeaturesInstallation, generateFeatureInstallScript, cleanupFeaturesDir } from './featuresInstaller';
+ import { Mount } from '../spec/spec-configuration/containerFeaturesConfiguration';
++import { substitute, beforeContainerSubstitute } from '../spec/spec-common/variableSubstitution';
+ 
+ /**
+  * Result from terminal build
+@@ -132,8 +134,27 @@ export class TerminalBuilder {
+ 			}
+ 		}
+ 
+-		// Read and parse the devcontainer.json (supports comments via JSONC)
+-		const devContainerConfig = jsonc.parse(fs.readFileSync(devcontainerPath, 'utf8'));
++		// Setup folder paths
++		const folderName = path.basename(workspaceFolder);
++		const remoteWorkspaceFolder = `/workspaces/${folderName}`;
++
++		// Labels identifying this dev container; also the inputs to ${devcontainerId}
++		const idLabels = {
++			'devcontainer.local_folder': workspaceFolder,
++			'devcontainer.config_file': devcontainerPath,
++		};
++
++		// Read and parse the devcontainer.json (supports comments via JSONC), then
++		// expand ${localEnv:...}, ${localWorkspaceFolder}, ${containerWorkspaceFolder},
++		// ${devcontainerId} etc., as the dev container spec requires. ${containerEnv:...}
++		// is left for later, since it can only be resolved inside the running container.
++		const devContainerConfig = beforeContainerSubstitute(idLabels, substitute({
++			platform: process.platform,
++			configFile: URI.file(devcontainerPath),
++			localWorkspaceFolder: workspaceFolder,
++			containerWorkspaceFolder: remoteWorkspaceFolder,
++			env: process.env,
++		}, jsonc.parse(fs.readFileSync(devcontainerPath, 'utf8'))));
+ 
+ 		// Determine the Dockerfile or image
+ 		const devcontainerDir = path.dirname(devcontainerPath);
+@@ -154,10 +175,6 @@ export class TerminalBuilder {
+ 			}
+ 		}
+ 
+-		// Setup folder paths
+-		const folderName = path.basename(workspaceFolder);
+-		const remoteWorkspaceFolder = `/workspaces/${folderName}`;
+-
+ 		// Build the image name
+ 		let builtImageName: string;
+ 		if (dockerfilePath) {
+@@ -313,10 +330,7 @@ export class TerminalBuilder {
+ 			containerUser: devContainerConfig.remoteUser,
+ 			env: devContainerConfig.containerEnv,
+ 			mounts,
+-			labels: {
+-				'devcontainer.local_folder': workspaceFolder,
+-				'devcontainer.config_file': devcontainerPath,
+-			},
++			labels: idLabels,
+ 			runArgs: devContainerConfig.runArgs,
+ 		});
+ 
+-- 
+2.43.0
+

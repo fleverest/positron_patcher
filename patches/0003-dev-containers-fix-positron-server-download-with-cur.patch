@@ -1,0 +1,53 @@
+From 5f3a2e161f8b7e12890e249fa2cb5a2066f71df2 Mon Sep 17 00:00:00 2001
+From: Floyd Everest <me@floydeverest.com>
+Date: Tue, 13 Oct 2026 12:34:42 +1100
+Subject: [PATCH 3/3] dev-containers: fix positron-server download with curl
+ (#12172)
+
+The curl branch of the server install script piped curl's stdout into
+tee | tar while also passing -w '%{http_code}'. The status code is
+written to stdout, so it was appended to the tarball: gzip reported
+trailing garbage, tar exited non-zero, and the captured 'HTTP_CODE' was
+tar's error text plus the '000' fallback. Installation was reported as
+failed even though extraction had usually succeeded, leaving the
+session unusable until a retry found the extracted binary.
+
+Download to a temporary file with -o so -w output is captured on its
+own, then extract only on HTTP 200.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FZKDAdw2eAGaetRMyaR7xv
+---
+ .../src/server/installScript.ts                  | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/extensions/positron-dev-containers/src/server/installScript.ts b/extensions/positron-dev-containers/src/server/installScript.ts
+index 28a74bbb9..f0fe490d8 100644
+--- a/extensions/positron-dev-containers/src/server/installScript.ts
++++ b/extensions/positron-dev-containers/src/server/installScript.ts
+@@ -158,9 +158,19 @@ else
+ 			esac
+ 		fi
+ 	elif [ "\${DOWNLOAD_TOOL}" = "curl" ]; then
+-		# curl with -v for verbose error information
+-		HTTP_CODE=\$(curl -w "%{http_code}" -fsSL "\${DOWNLOAD_URL}" 2>/tmp/curl.err | tee /tmp/download.tar.gz | tar -xz -C "\${INSTALL_DIR}" --strip-components=1 2>&1 || echo "000")
+-		if [ "\${HTTP_CODE}" != "200" ] && [ "\${HTTP_CODE}" != "000" ]; then
++		# Download to a file first: curl's -w output goes to stdout, so it must
++		# not share a stream with the tarball (it would be appended to it).
++		TARBALL="/tmp/positron-server-\$\$.tar.gz"
++		HTTP_CODE=\$(curl -w "%{http_code}" -fsSL -o "\${TARBALL}" "\${DOWNLOAD_URL}" 2>/tmp/curl.err) || true
++		if [ "\${HTTP_CODE}" = "200" ]; then
++			if ! tar -xzf "\${TARBALL}" -C "\${INSTALL_DIR}" --strip-components=1; then
++				rm -f "\${TARBALL}"
++				error "Failed to extract server archive downloaded from \${DOWNLOAD_URL}"
++			fi
++			rm -f "\${TARBALL}"
++		else
++			rm -f "\${TARBALL}"
++			HTTP_CODE=\${HTTP_CODE:-000}
+ 			case "\${HTTP_CODE}" in
+ 				404)
+ 					error "File not found (HTTP 404): \${DOWNLOAD_URL}. This version may not be available yet or the URL may be incorrect."
+-- 
+2.43.0
+

@@ -1,0 +1,48 @@
+From 39c5f9d3423877d1fa9eaf7d661e9db158882b7f Mon Sep 17 00:00:00 2001
+From: Floyd Everest <me@floydeverest.com>
+Date: Tue, 13 Oct 2026 12:34:00 +1100
+Subject: [PATCH 2/3] dev-containers: use a POSIX EXIT trap in the build script
+ (#14943)
+
+The terminal build script runs under /bin/sh but used 'trap ... ERR',
+a bash extension. On systems where /bin/sh is dash (Debian, Ubuntu) the
+script dies immediately with 'trap: ERR: bad trap'. Use an EXIT trap
+that checks $? instead, which behaves the same under set -e in any
+POSIX shell. Also make the 'press Enter' read non-fatal so the trap
+always exits 0 as intended.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FZKDAdw2eAGaetRMyaR7xv
+---
+ .../src/container/terminalBuilder.ts                       | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/extensions/positron-dev-containers/src/container/terminalBuilder.ts b/extensions/positron-dev-containers/src/container/terminalBuilder.ts
+index f2ea76bd2..48872d872 100644
+--- a/extensions/positron-dev-containers/src/container/terminalBuilder.ts
++++ b/extensions/positron-dev-containers/src/container/terminalBuilder.ts
+@@ -210,9 +210,10 @@ export class TerminalBuilder {
+ 
+ 		const generateShellScript = () => {
+ 			let script = '#!/bin/sh\nset -e\n\n';
+-			script += '# Trap errors to keep terminal open so user can see what failed\n';
++			script += '# Trap failures to keep terminal open so user can see what failed\n';
+ 			script += '# Write error marker and exit 0 to avoid VS Code toast about exit code\n';
+-			script += `trap 'echo ""; echo "==> ERROR: Build failed! Press Enter to close this terminal..."; echo "failed" > "${errorPath}"; read dummy; exit 0' ERR\n\n`;
++			script += '# (POSIX EXIT trap rather than bash-only ERR, since /bin/sh may be dash)\n';
++			script += `trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo ""; echo "==> ERROR: Build failed! Press Enter to close this terminal..."; echo "failed" > "${errorPath}"; read dummy || true; fi; exit 0' EXIT\n\n`;
+ 
+ 			if (rebuild) {
+ 				script += 'echo "==> Removing existing containers..."\n';
+@@ -431,7 +432,7 @@ export class TerminalBuilder {
+ 
+ 			scriptContent += 'echo "==> Container ready!"\n';
+ 			scriptContent += `echo "done" > "${markerPath}"\n`;
+-			scriptContent += 'trap - ERR\n';
++			scriptContent += 'trap - EXIT\n';
+ 			scriptContent += 'exit 0\n';
+ 		}
+ 
+-- 
+2.43.0
+
